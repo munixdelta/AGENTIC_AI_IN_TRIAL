@@ -1,0 +1,1210 @@
+import json
+import os
+import re
+import time
+
+import chromadb
+import pymupdf
+from dotenv import load_dotenv
+from groq import Groq
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder, SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+load_dotenv()
+
+api_key = os.getenv("GROQ_API_KEY")
+
+if not api_key:
+    raise ValueError("GROQ_API_KEY is missing. Add it to your .env file.")
+# Keep the existing variable name to avoid changing the rest of the project.
+
+gemini_client = Groq(api_key=api_key)
+
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+
+def generate_with_retry(model=None, contents="", retries=3):
+    """Send a prompt to Groq with limited retries for temporary failures."""
+    model = model or GROQ_MODEL
+    for attempt in range(retries):
+        try:
+            return gemini_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": contents}],
+            )
+        except Exception as e:
+            error_text = str(e).lower()
+            is_rate_limit = "429" in error_text or "rate limit" in error_text
+            is_temporary = any(
+                code in error_text for code in ("500", "502", "503", "504")
+            )
+            if not (is_rate_limit or is_temporary) or attempt == retries - 1:
+                raise
+            wait_time = 10 if is_rate_limit else 2 ** (attempt + 1)
+            print(f"Groq temporary error. Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+
+# ============================================================
+# 1. FIND ALL PDF FILES
+# ============================================================
+documents_folder = "documents"
+
+pdf_files = [
+    file
+    for file in os.listdir(documents_folder)
+    if file.lower().endswith(".pdf")
+]
+
+print("PDF files found:", pdf_files)
+
+if not pdf_files:
+    raise FileNotFoundError("No PDF files found in the ./documents folder.")
+
+# ============================================================
+# 2. EXTRACT TEXT FROM ALL PDFs
+# ============================================================
+pages = []
+
+for pdf_file in pdf_files:
+    pdf_path = os.path.join(
+        documents_folder,
+        pdf_file
+    )
+    pdf = pymupdf.open(pdf_path)
+    for page_number, page in enumerate(pdf):
+        text = page.get_text()
+        pages.append({
+            "text": text,
+            "page_number": page_number + 1,
+            "source": pdf_file
+        })
+    pdf.close()
+
+print("\nTotal Pages:", len(pages))
+
+if not pages:
+    raise ValueError("No text pages were extracted. Check that the PDFs contain extractable text.")
+
+# ============================================================
+# 3. SHOW FIRST PAGE
+# ============================================================
+print("\n===== FIRST PAGE =====\n")
+
+print(pages[0]["text"])
+
+print(
+    "\nPage Number:",
+    pages[0]["page_number"]
+)
+
+print(
+    "Source:",
+    pages[0]["source"]
+)
+
+# ============================================================
+# 4. CHUNKING FUNCTION
+# ============================================================
+def split_into_sentences(text):
+    """Split text at sentence boundaries while retaining punctuation."""
+    text = re.sub(r"\\s+", " ", text).strip()
+    if not text:
+        return []
+
+    parts = re.split(r"(?<=[.!?])\\s+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def chunk_text(text, chunk_size=100, overlap=20):
+    """Create chunks from complete sentences to avoid cutting evidence mid-sentence."""
+    sentences = split_into_sentences(text)
+    if not sentences:
+        return []
+    chunks = []
+    current_sentences = []
+    current_words = 0
+    for sentence in sentences:
+        sentence_words = len(sentence.split())
+        if current_sentences and current_words + sentence_words > chunk_size:
+            chunks.append(" ".join(current_sentences))
+            overlap_sentences = []
+            overlap_words = 0
+            for previous_sentence in reversed(current_sentences):
+                word_count = len(previous_sentence.split())
+                if overlap_words + word_count > overlap and overlap_sentences:
+                    break
+                overlap_sentences.insert(0, previous_sentence)
+                overlap_words += word_count
+                if overlap_words >= overlap:
+                    break
+            current_sentences = overlap_sentences
+            current_words = sum(len(item.split()) for item in current_sentences)
+        current_sentences.append(sentence)
+        current_words += sentence_words
+    if current_sentences:
+        final_chunk = " ".join(current_sentences)
+        if not chunks or final_chunk != chunks[-1]:
+            chunks.append(final_chunk)
+    return chunks
+
+# ============================================================
+# 5. CREATE CHUNKS + METADATA
+# ============================================================
+all_chunks = []
+
+chunk_metadata = []
+
+for page in pages:
+    chunks = chunk_text(
+        page["text"]
+    )
+    for chunk in chunks:
+        all_chunks.append(chunk)
+        chunk_metadata.append({
+            "page_number": page["page_number"],
+            "source": page["source"]
+        })
+
+print("\n===== TOTAL CHUNKS =====")
+
+print(len(all_chunks))
+
+# ============================================================
+# 6. SHOW FIRST CHUNK
+# ============================================================
+print("\n===== FIRST CHUNK =====")
+
+if not all_chunks:
+    raise ValueError("No text chunks were created from the PDFs.")
+
+print(all_chunks[0])
+
+print(
+    "\nPage:",
+    chunk_metadata[0]["page_number"]
+)
+
+print(
+    "Source:",
+    chunk_metadata[0]["source"]
+)
+
+# ============================================================
+# 7. GROQ CLIENT
+# Groq client is initialized at the top of this file.
+
+# ============================================================
+
+# ============================================================
+# 8. ORIGINAL USER QUERY
+# ============================================================
+original_query = "What is the role of an optimizer in neural networks?"
+
+# ============================================================
+# 9. QUERY REWRITING
+# ============================================================
+rewrite_prompt = f"""
+Rewrite the following user query into a clear,
+retrieval-friendly query.
+The rewritten query should preserve the original
+meaning while making important technical terms
+explicit.
+Do not answer the question.
+Only return the rewritten query.
+User query:
+{original_query}
+"""
+
+rewrite_response = generate_with_retry(
+    model=GROQ_MODEL,
+    contents=rewrite_prompt
+)
+
+rewritten_query = (
+    (rewrite_response.choices[0].message.content or "").strip()
+)
+
+print("\n===== QUERY REWRITING =====")
+
+print("\nOriginal Query:")
+
+print(original_query)
+
+print("\nRewritten Query:")
+
+print(rewritten_query)
+
+# ============================================================
+# 9.5. MULTI-QUERY GENERATION
+# ============================================================
+multi_query_prompt = f"""
+Generate 3 different retrieval queries for the following
+user question.
+Each query should approach the same information need
+from a slightly different perspective.
+Do not answer the question.
+Only return the 3 queries, one per line.
+Original user question:
+{original_query}
+Retrieval-friendly query:
+{rewritten_query}
+"""
+
+multi_query_response = generate_with_retry(
+    model=GROQ_MODEL,
+    contents=multi_query_prompt
+)
+
+generated_queries = [
+    q.strip().lstrip("-•0123456789. ").strip()
+    for q in (multi_query_response.choices[0].message.content or "").splitlines()
+    if q.strip()
+]
+
+# Include the original and rewritten queries so retrieval is not dependent
+# only on LLM-generated alternatives.
+multi_queries = []
+for query in [original_query, rewritten_query, *generated_queries]:
+    if query and all(
+        existing.casefold() != query.casefold()
+        for existing in multi_queries
+    ):
+        multi_queries.append(query)
+
+multi_queries = multi_queries[:5]
+
+print("\n===== MULTI-QUERY GENERATION =====")
+
+for i, q in enumerate(multi_queries, start=1):
+    print(f"Query {i}: {q}")
+
+# ============================================================
+# 10. BM25 SEARCH
+# ============================================================
+tokenized_chunks = [
+    chunk.lower().split()
+    for chunk in all_chunks
+]
+
+bm25 = BM25Okapi(tokenized_chunks)
+# IMPORTANT:
+# BM25 now uses REWRITTEN QUERY
+
+bm25_query = rewritten_query.lower().split()
+
+bm25_scores = bm25.get_scores(bm25_query)
+# Get Top 5 BM25 results
+
+top_bm25_indices = sorted(
+    range(len(bm25_scores)),
+    key=lambda i: bm25_scores[i],
+    reverse=True
+)[:5]
+
+print("\n===== BM25 RESULTS USING REWRITTEN QUERY =====")
+
+for rank, index in enumerate(top_bm25_indices, start=1):
+    print(f"\nResult: {rank}")
+    print(f"ID: chunk_{index + 1}")
+    print(f"BM25 Score: {bm25_scores[index]:.4f}")
+    print(f"Page: {chunk_metadata[index]['page_number']}")
+    print(f"Source: {chunk_metadata[index]['source']}")
+    print(f"Text: {all_chunks[index]}")
+
+# ============================================================
+# 10.5. BM25 SEARCH FOR MULTIPLE QUERIES
+# ============================================================
+multi_bm25_results = {}
+
+for query_number, query in enumerate(multi_queries, start=1):
+    tokenized_query = query.lower().split()
+    scores = bm25.get_scores(tokenized_query)
+    top_indices = sorted(
+        range(len(scores)),
+        key=lambda i: scores[i],
+        reverse=True
+    )[:5]
+    multi_bm25_results[query_number] = {
+        "query": query,
+        "indices": top_indices,
+        "scores": scores
+    }
+
+print("\n===== MULTI-QUERY BM25 RESULTS =====")
+
+for query_number, data in multi_bm25_results.items():
+    print(f"\n--- Query {query_number} ---")
+    print(data["query"])
+    for rank, index in enumerate(data["indices"], start=1):
+        print(f"\nRank: {rank}")
+        print(f"ID: chunk_{index + 1}")
+        print(f"BM25 Score: {data['scores'][index]:.4f}")
+        print(f"Page: {chunk_metadata[index]['page_number']}")
+        print(f"Source: {chunk_metadata[index]['source']}")
+
+# ============================================================
+# 10.6. MULTI-QUERY RRF FUSION
+# ============================================================
+multi_query_rrf = {}
+
+k = 60
+
+for query_number, data in multi_bm25_results.items():
+    for rank, index in enumerate(data["indices"], start=1):
+        chunk_id = f"chunk_{index + 1}"
+        score = 1 / (k + rank)
+        multi_query_rrf[chunk_id] = (
+            multi_query_rrf.get(chunk_id, 0) + score
+        )
+# Sort by combined RRF score
+
+multi_query_hybrid = sorted(
+    multi_query_rrf.items(),
+    key=lambda x: x[1],
+    reverse=True
+)
+
+print("\n===== MULTI-QUERY RRF RESULTS =====")
+
+for rank, (chunk_id, score) in enumerate(multi_query_hybrid, start=1):
+    print(
+        f"Rank: {rank} | "
+        f"ID: {chunk_id} | "
+        f"RRF Score: {score:.6f}"
+    )
+
+# ============================================================
+# 11. CREATE SENTENCE EMBEDDINGS
+# ============================================================
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+embeddings = model.encode(all_chunks).tolist()
+
+# ============================================================
+# 12. CREATE CHROMADB CLIENT
+# ============================================================
+chroma_client = chromadb.Client()
+
+# ============================================================
+# 13. CREATE COLLECTION
+# ============================================================
+collection = chroma_client.create_collection(
+    name="day8_query_rewriting"
+)
+
+# ============================================================
+# 14. STORE CHUNKS IN CHROMADB
+# ============================================================
+ids = [
+    f"chunk_{i + 1}"
+    for i in range(len(all_chunks))
+]
+
+collection.add(
+    documents=all_chunks,
+    embeddings=embeddings,
+    ids=ids,
+    metadatas=chunk_metadata
+)
+
+print("\n===== CHROMADB =====")
+
+print("Total stored chunks:", collection.count())
+
+# ============================================================
+# 15. MULTI-QUERY EMBEDDINGS
+# ============================================================
+multi_query_embeddings = model.encode(multi_queries).tolist()
+
+# ============================================================
+# 16. MULTI-QUERY SEMANTIC RETRIEVAL
+# ============================================================
+multi_semantic_results = {}
+
+for query_number, query_embedding in enumerate(
+    multi_query_embeddings,
+    start=1
+):
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=5
+    )
+    multi_semantic_results[query_number] = results
+    print(f"\n===== SEMANTIC RESULTS FOR QUERY {query_number} =====")
+    print(multi_queries[query_number - 1])
+    for rank in range(len(results["ids"][0])):
+        print(f"\nRank: {rank + 1}")
+        print(f"ID: {results['ids'][0][rank]}")
+        print(f"Distance: {results['distances'][0][rank]:.4f}")
+        print(
+            f"Page: "
+            f"{results['metadatas'][0][rank]['page_number']}"
+        )
+        print(
+            f"Source: "
+            f"{results['metadatas'][0][rank]['source']}"
+        )
+
+# ============================================================
+# 17. MULTI-QUERY SIMILARITY THRESHOLD
+# ============================================================
+threshold = 0.80
+
+filtered_semantic_results = {}
+
+for query_number, results in multi_semantic_results.items():
+    filtered_indices = []
+    for i in range(len(results["ids"][0])):
+        distance = results["distances"][0][i]
+        # Keep the retrieved top-k candidates for RRF. Chroma distances are
+        # model-specific, so a fixed cutoff can discard useful evidence.
+        filtered_indices.append(i)
+    filtered_semantic_results[query_number] = filtered_indices
+    print(f"\n===== THRESHOLD RESULTS FOR QUERY {query_number} =====")
+    for i in filtered_indices:
+        print(
+            f"ID: {results['ids'][0][i]} | "
+            f"Distance: {results['distances'][0][i]:.4f} | "
+            f"Page: {results['metadatas'][0][i]['page_number']} | "
+            f"Source: {results['metadatas'][0][i]['source']}"
+        )
+    print(f"Total results after threshold: {len(filtered_indices)}")
+
+# ============================================================
+# 18. MULTI-QUERY HYBRID RRF FUSION
+# ============================================================
+k = 60
+
+final_rrf_scores = {}
+
+# ============================================================
+# 18.1 BM25 RESULTS FROM ALL QUERIES
+# ============================================================
+for query_number, data in multi_bm25_results.items():
+    for rank, index in enumerate(data["indices"], start=1):
+        chunk_id = f"chunk_{index + 1}"
+        score = 1 / (k + rank)
+        final_rrf_scores[chunk_id] = (
+            final_rrf_scores.get(chunk_id, 0) + score
+        )
+
+# ============================================================
+# 18.2 SEMANTIC RESULTS FROM ALL QUERIES
+# USING THRESHOLD-FILTERED RESULTS
+
+# ============================================================
+for query_number, results in multi_semantic_results.items():
+    filtered_indices = filtered_semantic_results[query_number]
+    for rank, i in enumerate(filtered_indices, start=1):
+        chunk_id = results["ids"][0][i]
+        score = 1 / (k + rank)
+        final_rrf_scores[chunk_id] = (
+            final_rrf_scores.get(chunk_id, 0) + score
+        )
+
+# ============================================================
+# 18.3 SORT FINAL RRF RESULTS
+# ============================================================
+final_hybrid_results = sorted(
+    final_rrf_scores.items(),
+    key=lambda x: x[1],
+    reverse=True
+)
+
+print("\n===== MULTI-QUERY HYBRID RRF RESULTS =====")
+
+for rank, (chunk_id, score) in enumerate(final_hybrid_results, start=1):
+    index = int(chunk_id.split("_")[1]) - 1
+    print(f"\nRank: {rank}")
+    print(f"ID: {chunk_id}")
+    print(f"RRF Score: {score:.6f}")
+    print(f"Page: {chunk_metadata[index]['page_number']}")
+    print(f"Source: {chunk_metadata[index]['source']}")
+
+# ============================================================
+# 19. CROSSENCODER RERANKING
+# ============================================================
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# ============================================================
+# 20. HYBRID RESULTS → ACTUAL CHUNKS
+# ============================================================
+candidate_chunks = []
+
+for chunk_id, rrf_score in final_hybrid_results:
+    index = int(chunk_id.split("_")[1]) - 1
+    document = all_chunks[index]
+    metadata = chunk_metadata[index]
+    candidate_chunks.append(
+        (chunk_id, document, rrf_score, metadata)
+    )
+
+# ============================================================
+# 21. CROSSENCODER RERANKING AGAINST THE ORIGINAL QUESTION
+# ============================================================
+# Multi-query retrieval improves recall, but reranking against the original
+# question improves precision and avoids a chunk scoring highly for only a
+# loosely related query variation.
+pairs = [
+    (original_query, document)
+    for chunk_id, document, rrf_score, metadata in candidate_chunks
+]
+
+pair_information = [
+    (chunk_id, document, rrf_score, metadata)
+    for chunk_id, document, rrf_score, metadata in candidate_chunks
+]
+
+# ============================================================
+# 22. CROSSENCODER SCORES
+# ============================================================
+scores = reranker.predict(pairs)
+
+# ============================================================
+# 23. STORE ORIGINAL-QUERY RERANKING SCORES
+# ============================================================
+best_chunk_scores = {}
+
+for i, score in enumerate(scores):
+    chunk_id, document, rrf_score, metadata = pair_information[i]
+    best_chunk_scores[chunk_id] = {
+        "score": float(score),
+        "document": document,
+        "rrf_score": rrf_score,
+        "metadata": metadata,
+    }
+
+# ============================================================
+# 24. SORT BY CROSSENCODER SCORE
+# ============================================================
+reranked = sorted(
+    best_chunk_scores.items(),
+    key=lambda item: (item[1]["score"], item[1]["rrf_score"]),
+    reverse=True,
+)
+
+# ============================================================
+# 25. SHOW FINAL RERANKED RESULTS
+# ============================================================
+print("\n===== ORIGINAL-QUERY CROSSENCODER RESULTS =====")
+
+for rank, (chunk_id, data) in enumerate(reranked, start=1):
+    print(f"\nRank: {rank}")
+    print(f"ID: {chunk_id}")
+    print(f"CrossEncoder Score: {data['score']:.4f}")
+    print(f"RRF Score: {data['rrf_score']:.6f}")
+    print("Reranked against: Original user question")
+    print(f"Page: {data['metadata']['page_number']}")
+    print(f"Source: {data['metadata']['source']}")
+    print(f"Text: {data['document']}")
+# CrossEncoder scores are ranking scores, not probabilities. Avoid a hard
+# numeric cutoff; keep the best-ranked candidates and let compression select evidence.
+
+context_top_k = 4
+
+filtered_reranked = reranked[:context_top_k]
+
+print("\n===== CONTEXT FILTERING =====")
+
+for chunk_id, data in filtered_reranked:
+    print(
+        f"ID: {chunk_id} | "
+        f"CrossEncoder Score: {data['score']:.4f}"
+    )
+
+print(
+    "Total chunks after context filtering: "
+    f"{len(filtered_reranked)}"
+)
+
+
+def compress_chunk(chunk, query, threshold=0.35, top_n=3):
+    """Keep the most query-relevant complete sentences from a chunk."""
+    sentences = split_into_sentences(chunk)
+    if not sentences:
+        return ""
+
+    sentence_embeddings = model.encode(sentences)
+    query_embedding = model.encode([query])
+
+    similarities = cosine_similarity(
+        query_embedding,
+        sentence_embeddings
+    )[0]
+
+    ranked_sentences = sorted(
+        enumerate(similarities),
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    # Keep sentences above the cutoff, but always retain the best match.
+    selected_indices = [
+        index
+        for index, score in ranked_sentences
+        if score >= threshold
+    ][:top_n]
+
+    if not selected_indices:
+        selected_indices = [ranked_sentences[0][0]]
+
+    # Restore source order for readable context.
+    selected_indices.sort()
+    return " ".join(sentences[index] for index in selected_indices)
+
+
+# ============================================================
+# 25.5. CONTEXT COMPRESSION
+# ============================================================
+compressed_chunks = []
+
+for chunk_id, data in filtered_reranked:
+    compressed_text = compress_chunk(
+        data["document"],
+        original_query,
+        threshold=0.35,
+        top_n=3
+    )
+    if compressed_text:
+        compressed_chunks.append(
+            (chunk_id, data, compressed_text)
+        )
+
+print("\n===== CONTEXT COMPRESSION =====")
+
+for chunk_id, data, compressed_text in compressed_chunks:
+    print(f"\nID: {chunk_id}")
+    print(f"Original Text:\n{data['document']}")
+    print(f"\nCompressed Text:\n{compressed_text}")
+
+# ============================================================
+# 26. FINAL CONTEXT
+# ============================================================
+top_n = min(4, len(compressed_chunks))
+
+context = "\n\n".join(
+    f"[Source: {data['metadata']['source']} | "
+    f"Page: {data['metadata']['page_number']}]\n"
+    f"{compressed_text}"
+    for chunk_id, data, compressed_text in compressed_chunks[:top_n]
+)
+
+if not context.strip():
+    raise ValueError(
+        "No usable context was retrieved. Check the PDFs, query, and retrieval results."
+    )
+
+print("\n===== FINAL CONTEXT =====")
+
+print(context)
+# Collect sources available in the final context
+
+available_sources = {
+    (
+        data["metadata"]["source"],
+        data["metadata"]["page_number"]
+    )
+    for chunk_id, data, compressed_text in compressed_chunks[:top_n]
+}
+
+print("\n===== AVAILABLE CITATION SOURCES =====")
+
+for source, page_number in sorted(available_sources):
+    print(f"[Source: {source}, Page: {page_number}]")
+
+# ============================================================
+# 27. FINAL GROQ ANSWER
+# ============================================================
+answer_prompt = f"""
+You are answering a question using a small set of retrieved PDF passages.
+Use only the supplied context. Do not use outside knowledge.
+
+CITATION RULES:
+- Every factual sentence must end with at least one inline citation.
+- Use exactly this format: [Source: filename.pdf, Page: X]
+- Cite the specific page that supports that sentence, not merely a page
+  that mentions the same general topic.
+- Only cite source/page pairs explicitly shown in the context below.
+- Never invent filenames, page numbers, quotations, or evidence.
+- Keep each sentence focused on one claim so its citation can be checked.
+- If the context does not support a detail, omit it or state that the
+  provided context does not contain enough information.
+- Do not claim that optimizer choice affects convergence speed or stability
+  unless the supplied context explicitly supports that relationship.
+
+Original user question:
+{original_query}
+
+Retrieved context:
+{context}
+
+Give a concise answer. Prioritize directly supported information over
+completeness. Do not mention retrieval queries or evaluation scores.
+"""
+
+response = generate_with_retry(
+    model=GROQ_MODEL,
+    contents=answer_prompt
+)
+
+# ============================================================
+# 28. FINAL ANSWER
+# ============================================================
+print("\n===== FINAL ANSWER =====")
+
+print(response.choices[0].message.content or "")
+
+answer = response.choices[0].message.content or ""
+
+# ============================================================
+# 29. CITATION VALIDATION
+# ============================================================
+# Extract citations from the generated answer.
+
+citations = re.findall(
+    r"\[Source:\s*(.*?),\s*Page:\s*(\d+)\]",
+    answer
+)
+
+print("\n===== CITATION VALIDATION =====")
+
+if not citations:
+    print("WARNING: No citations found in the answer.")
+else:
+    for source, page_number in citations:
+        citation = (source.strip(), int(page_number))
+        if citation in available_sources:
+            print(
+                f"VALID: {source}, Page {page_number}"
+            )
+        else:
+            print(
+                f"INVALID: {source}, Page {page_number}"
+            )
+
+# ============================================================
+# 30. INVALID CITATION TEST
+# ============================================================
+# Temporary test: check a source that was not retrieved.
+
+test_citation = (
+    "Deep_Learning_Fundamentals.pdf",
+    99
+)
+
+print("\n===== INVALID CITATION TEST =====")
+
+if test_citation in available_sources:
+    print("VALID")
+else:
+    print("INVALID: Source/page not present in final context")
+
+# ============================================================
+# 31. SENTENCE-LEVEL CITATION COVERAGE
+# ============================================================
+# Check sentence-level citation coverage.
+
+answer = response.choices[0].message.content or ""
+
+sentences = [
+    sentence.strip()
+    for sentence in re.split(r"(?<=[.!?])\s+", answer)
+    if sentence.strip()
+]
+# Ignore headings and standalone source references.
+
+factual_sentences = [
+    sentence
+    for sentence in sentences
+    if not sentence.startswith("[Source:")
+    and not sentence.startswith("#")
+]
+
+cited_sentences = [
+    sentence
+    for sentence in factual_sentences
+    if re.search(
+        r"\[Source:\s*.*?,\s*Page:\s*\d+\]",
+        sentence
+    )
+]
+
+total = len(factual_sentences)
+
+cited = len(cited_sentences)
+
+print("\n===== SENTENCE-LEVEL CITATION COVERAGE =====")
+
+print(f"Factual sentences: {total}")
+
+print(f"Sentences with citations: {cited}")
+
+if total > 0:
+    coverage = (cited / total) * 100
+    print(f"Citation coverage: {coverage:.1f}%")
+else:
+    print("Citation coverage could not be calculated.")
+
+# ============================================================
+# DAY 12 - STEP 2: EXTRACT CLAIMS
+# ============================================================
+print("\n===== CLAIM EXTRACTION =====")
+
+claims = [
+    sentence.strip()
+    for sentence in re.split(r"(?<=[.!?])\s+", answer)
+    if sentence.strip()
+    and not sentence.startswith("[Source:")
+    and not sentence.startswith("#")
+]
+
+for i, claim in enumerate(claims, start=1):
+    print(f"Claim {i}: {claim}")
+
+print(f"\nTotal claims extracted: {len(claims)}")
+
+# ============================================================
+# DAY 12 - STEP 3: SEPARATE CLAIMS AND CITATIONS
+# ============================================================
+print("\n===== CLAIMS AND CITATIONS =====")
+
+claim_records = []
+
+for sentence in claims:
+    sentence_citations = re.findall(
+        r"\[Source:\s*(.*?),\s*Page:\s*(\d+)\]",
+        sentence
+    )
+    claim_text = re.sub(
+        r"\[Source:\s*.*?,\s*Page:\s*\d+\]",
+        "",
+        sentence
+    ).strip()
+    if claim_text:
+        claim_records.append({
+            "claim": claim_text,
+            "citations": [
+                (source.strip(), int(page))
+                for source, page in sentence_citations
+            ]
+        })
+
+for i, record in enumerate(claim_records, start=1):
+    print(f"\nClaim {i}: {record['claim']}")
+    print(f"Citations: {record['citations']}")
+
+print(f"\nTotal claim records: {len(claim_records)}")
+
+# ============================================================
+# DAY 12 - STEP 4: CLAIM-SOURCE SUPPORT VERIFICATION
+# ============================================================
+supported_count = 0
+
+not_supported_count = 0
+
+uncertain_count = 0
+
+print("\n===== CLAIM-SOURCE SUPPORT VERIFICATION =====")
+
+for i, record in enumerate(claim_records, start=1):
+    print(f"\nClaim {i}: {record['claim']}")
+    if not record["citations"]:
+        print("Result: NOT_SUPPORTED")
+        print("Reason: No citation provided.")
+        not_supported_count += 1
+        continue
+    for source, page_number in record["citations"]:
+        # Find the exact cited page text.
+        page_text = next(
+            (
+                page["text"]
+                for page in pages
+                if page["source"] == source
+                and page["page_number"] == page_number
+            ),
+            None
+        )
+        if not page_text:
+            print(
+                f"Result: NOT_SUPPORTED — "
+                f"{source}, Page {page_number}"
+            )
+            not_supported_count += 1
+            continue
+        verification_prompt = f"""
+You are a claim-source verification evaluator.
+Determine whether THIS CITED PAGE explicitly supports the entire claim.
+Do not use information from other pages or general knowledge.
+If the page supports only part of a multi-part claim, return NOT_SUPPORTED.
+Return exactly one label:
+SUPPORTED
+NOT_SUPPORTED
+UNCERTAIN
+Claim:
+{record['claim']}
+Source filename: {source}
+Page number: {page_number}
+Source text:
+{page_text}
+Judge only from the provided source text.
+Do not use outside knowledge.
+Return only the label.
+"""
+        # Groq replaces the previous Gemini API call.
+        verification_response = generate_with_retry(
+            model=GROQ_MODEL,
+            contents=verification_prompt
+        )
+        result = (
+            verification_response.choices[0].message.content or ""
+        ).strip().upper()
+        if "NOT_SUPPORTED" in result:
+            label = "NOT_SUPPORTED"
+        elif "SUPPORTED" in result:
+            label = "SUPPORTED"
+        else:
+            label = "UNCERTAIN"
+        print(f"Source: {source}, Page {page_number}")
+        if label == "SUPPORTED":
+            supported_count += 1
+        elif label == "NOT_SUPPORTED":
+            not_supported_count += 1
+        else:
+            uncertain_count += 1
+        print(f"Result: {label}")
+
+# ============================================================
+# DAY 12 - STEP 6: FINAL VERIFICATION SUMMARY
+# ============================================================
+print("\n===== FINAL VERIFICATION SUMMARY =====")
+
+total_checks = (
+    supported_count
+    + not_supported_count
+    + uncertain_count
+)
+
+print(f"Total verification checks: {total_checks}")
+
+print(f"Supported: {supported_count}")
+
+print(f"Not Supported: {not_supported_count}")
+
+print(f"Uncertain: {uncertain_count}")
+
+if total_checks > 0:
+    support_rate = (supported_count / total_checks) * 100
+    print(f"Support rate: {support_rate:.1f}%")
+else:
+    print("No verification checks were completed.")
+
+# ============================================================
+# DAY 13 - STEP 3: FAITHFULNESS EVALUATION
+# ============================================================
+print("\n===== FAITHFULNESS EVALUATION =====")
+
+faithfulness_prompt = f"""
+You are evaluating the faithfulness of an AI-generated answer.
+Compare the answer only against the provided context.
+Classify each factual claim as:
+- SUPPORTED: The context supports the claim.
+- NOT_SUPPORTED: The context does not support the claim.
+- CONTRADICTED: The context directly contradicts the claim.
+Context:
+{context}
+Generated Answer:
+{answer}
+For each factual claim, provide:
+1. The claim
+2. One of the three labels
+3. A brief reason based only on the context
+Do not use outside knowledge.
+"""
+
+faithfulness_response = generate_with_retry(
+    model=GROQ_MODEL,
+    contents=faithfulness_prompt
+)
+
+faithfulness_result = (
+    faithfulness_response.choices[0].message.content or ""
+)
+
+print(faithfulness_result)
+
+# ============================================================
+# DAY 14 - PRACTICAL RAG EVALUATION
+# ============================================================
+
+
+def parse_json_response(raw_text):
+    """Parse JSON returned by the evaluator, including fenced JSON output."""
+    raw_text = (raw_text or "").strip()
+    raw_text = re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw_text, flags=re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+        return None
+
+
+# A. CONTEXT RELEVANCE: judge the passages actually sent to the answer model.
+
+print("\n===== DAY 14: CONTEXT RELEVANCE EVALUATION =====")
+
+context_passages = []
+
+for index, (chunk_id, data, compressed_text) in enumerate(
+    compressed_chunks[:top_n], start=1
+):
+    context_passages.append({
+        "id": chunk_id,
+        "source": data["metadata"]["source"],
+        "page": data["metadata"]["page_number"],
+        "text": compressed_text,
+    })
+
+if context_passages:
+    passage_text = "\n\n".join(
+        f"Passage ID: {item['id']}\n"
+        f"Source: {item['source']}\n"
+        f"Page: {item['page']}\n"
+        f"Text: {item['text']}"
+        for item in context_passages
+    )
+    context_relevance_prompt = f"""
+Evaluate how relevant each retrieved passage is to the user's specific question.
+Judge the passage's usefulness for answering the question, not just whether it shares the same broad topic.
+Return ONLY valid JSON in this shape:
+{{"passages": [{{"id": "chunk_id", "label": "RELEVANT", "reason": "short reason"}}]}}
+Use exactly one label per passage: RELEVANT, PARTIALLY_RELEVANT, or IRRELEVANT.
+Include every passage ID exactly once. Do not invent passage IDs.
+
+User question:
+{original_query}
+
+Passages:
+{passage_text}
+"""
+    context_eval_response = generate_with_retry(
+        model=GROQ_MODEL,
+        contents=context_relevance_prompt
+    )
+    context_eval_raw = context_eval_response.choices[0].message.content or ""
+    context_eval = parse_json_response(context_eval_raw)
+    if context_eval and isinstance(context_eval.get("passages"), list):
+        valid_labels = {"RELEVANT", "PARTIALLY_RELEVANT", "IRRELEVANT"}
+        label_counts = {label: 0 for label in valid_labels}
+        expected_ids = {item["id"] for item in context_passages}
+        seen_ids = set()
+
+        for result in context_eval["passages"]:
+            passage_id = str(result.get("id", "")).strip()
+
+            # Ignore duplicate or invented IDs from the evaluator response.
+            if passage_id not in expected_ids or passage_id in seen_ids:
+                continue
+
+            seen_ids.add(passage_id)
+            label = str(result.get("label", "")).upper().strip()
+            if label not in valid_labels:
+                label = "PARTIALLY_RELEVANT"
+
+            label_counts[label] += 1
+            print(
+                f"{passage_id}: {label} — "
+                f"{result.get('reason', 'No reason provided')}"
+            )
+
+        missing_ids = expected_ids - seen_ids
+        if missing_ids:
+            print("Passages not scored by evaluator:", sorted(missing_ids))
+
+        evaluated_count = sum(label_counts.values())
+        if evaluated_count:
+            relevant_pct = label_counts["RELEVANT"] / evaluated_count * 100
+            print(
+                f"Fully relevant passages: "
+                f"{label_counts['RELEVANT']}/{evaluated_count}"
+            )
+            print(f"Fully relevant passage ratio: {relevant_pct:.1f}%")
+        print("Context relevance label counts:", label_counts)
+    else:
+        print("Could not parse the evaluator's JSON. Raw evaluation follows:")
+        print(context_eval_raw)
+else:
+    print("No passages were available to evaluate.")
+
+
+# B. ANSWER RELEVANCE: judge whether the final answer addresses the original question.
+
+print("\n===== DAY 14: ANSWER RELEVANCE EVALUATION =====")
+
+answer_relevance_prompt = f"""
+Evaluate how well the answer addresses the user's original question.
+Judge relevance and completeness, not factual support by the context.
+Return ONLY valid JSON in this shape:
+{{"score": 1, "reason": "short explanation"}}
+Use an integer score from 1 to 5:
+1 = does not answer the question
+2 = only loosely related or mostly incomplete
+3 = partly answers the question, with important gaps
+4 = directly answers the question with minor gaps
+5 = directly and sufficiently answers the question
+Do not reward an answer merely for discussing the same broad topic.
+
+Original user question:
+{original_query}
+
+Generated answer:
+{answer}
+"""
+
+answer_eval_response = generate_with_retry(
+    model=GROQ_MODEL,
+    contents=answer_relevance_prompt
+)
+
+answer_eval_raw = answer_eval_response.choices[0].message.content or ""
+
+answer_eval = parse_json_response(answer_eval_raw)
+
+if answer_eval and isinstance(answer_eval.get("score"), (int, float)):
+    answer_relevance_score = max(1, min(5, int(answer_eval["score"])))
+    print(f"Answer relevance score: {answer_relevance_score}/5")
+    print(f"Reason: {answer_eval.get('reason', 'No reason provided')}")
+else:
+    answer_relevance_score = None
+    print("Could not parse the evaluator's JSON. Raw evaluation follows:")
+    print(answer_eval_raw)
+
+
+# C. COMBINED SUMMARY. These are separate signals, not one universal quality score.
+
+print("\n===== DAY 14: RAG EVALUATION SUMMARY =====")
+
+print(f"Retrieved passages evaluated: {len(context_passages)}")
+print(f"Context passages sent to answer model: {top_n}")
+
+if answer_relevance_score is not None:
+    print(f"Answer relevance: {answer_relevance_score}/5")
+else:
+    print("Answer relevance: unavailable (evaluation response was not parseable)")
+
+print("Faithfulness evaluation: see DAY 13 - STEP 3 output above.")
+
+print("Citation validation and citation coverage: see sections 29 and 31 above.")
+
+print("Note: LLM-based evaluation is an estimate. Review borderline judgments manually.")
